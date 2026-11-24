@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 Niek Ilmer <niek@beunie.nl>
+# Let members of the "scanner" group use the Agfa Vision 35 through the SCSI generic driver.
+# Install:  sudo cp 70-agfa-vision35.rules /etc/udev/rules.d/ && sudo udevadm control --reload
+# then replug/reload the SCSI bus (or reboot) and add your user:  sudo usermod -aG scanner $USER
+# On Debian the SANE udev rules usually already grant this; only needed if /dev/sgN is not accessible.
+SUBSYSTEM=="scsi_generic", ATTRS{type}=="6", ATTRS{vendor}=="AGFA*", ATTRS{model}=="VISION 35*", GROUP="scanner", MODE="0660"

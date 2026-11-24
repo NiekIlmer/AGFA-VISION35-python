@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+# scans and calibration data are personal and large
+*.tif
+*.tiff
+*.raw
+calibration.json
+calibration-scan.png
+scanner_log/
+*.log
