@@ -10,14 +10,19 @@
   scan --mono [R|G|B]         black & white negative: one filter only (default R), about 2 min
   scan --preview              quick low-res greyscale preview (about 25 s) -> preview-N.tiff, no calibration needed
   scan --positive             8-bit positive for viewing (negative inverted + auto levels)
+  scan calibrate-sensor       once per scanner, with the film holder EMPTY: measure the sensor's fixed streak
+                              pattern (green and blue) so every scan can correct it
+  scan calibrate-dark         once per scanner, with the aperture COVERED (two layers of foil): measure the true
+                              zero-light level at several exposures; scans use it as their black reference
 
 The output is flipped top-to-bottom by default (upright for film loaded the usual way); --no-flip, --flip-h and
 --rotate adjust that.
 
 How the scanner's signal works (measured, see docs/PROTOCOL.md): the scanner reports an inverted 8-bit signal s.
 The film holder (no light) reads ~253 and clearer film reads lower, so light is linear in (s_black - s).  DN04 is
-the same signal with about 2.04x the gain (it clips a bright channel); DN01 is the low-gain setting.  `calibrate`
-measures black and blank film at the DN setting chosen for each channel, plus the lamp falloff across the film.
+DNnn is an exposure setting: light scales as 10^((nn-mm)/10) between DN mm and DN nn (DN04 = 2x DN01).  `calibrate`
+measures black and blank film at the highest DN each channel can use, plus the lamp falloff across the film, and
+`scan` then raises the exposure further when the frame itself is denser than blank film (auto-exposure).
 
 Default output (--output negpy): untagged 16-bit TIFF, linear transmittance relative to the blank film (blank film
 = 0.75 of full scale, holder = 0), flat-fielded, NOT inverted, for converting negatives in NegPy or similar.  The
@@ -30,7 +35,7 @@ text commands are whitelisted (traced ones plus WGMnT tables, whose format was v
 trace logged those writes truncated).  No scanner firmware is ever written.
 """
 __version__ = "0.1.0"
-import argparse, ctypes, datetime, fcntl, glob, json, math, os, re, struct, sys, time, zlib
+import argparse, ctypes, datetime, fcntl, glob, json, math, os, re, shutil, struct, sys, time, zlib
 
 SG_IO = 0x2285
 ALLOWED_OPS = {0x12, 0x00, 0x03, 0x2A, 0x28}
@@ -38,7 +43,7 @@ DXFER_NONE, DXFER_TO, DXFER_FROM = -1, -2, -3
 
 # every text command that appears in the trace and that this tool may send
 ALLOWED_TEXT = re.compile(
-    r"^(APIN|OUT8|AF,R|MP|CP|GML8|IF15|INM|SPUP|NHD|AP50|AVOF|SDON|DN0[14]|BRT0|CNT0|SFT0|PSOF|PVOF|"
+    r"^(APIN|OUT8|AF,R|MP|CP|GML8|IF15|INM|SPUP|NHD|AP50|AVOF|SDON|DN(0[0-9]|1[0-2])|BRT0|CNT0|SFT0|PSOF|PVOF|"
     r"F[RGB],R|GM[123]T8|MV0,R|MV345,R|"
     r"BXZ 0,0,4999,4999,13,13,V|BXZ 345,135,4757,3015,1,1,V)$")
 
@@ -51,16 +56,33 @@ SCAN_W, SCAN_LINES = 2882, 4413          # 2881 samples + 1 pad byte
 PREVIEW_TABLE = [min(255, max(0, round(255 * (i - 150) / (251 - 150)))) for i in range(256)]
 PREVIEW_TABLE[255] = 255
 
-DN_GAIN = 2.04            # measured: DN04 has 2.04x the gain of DN01 (signal s = 255 - gain * light)
+DN_MAX = 12               # highest exposure step used: scan time per line is flat up to ~DN12 and grows beyond
+EXPOSURE_HEADROOM = 1.25  # auto-exposure keeps the frame's clearest area x1.25 below saturation
+
+
+def dn_number(dn):
+    return int(dn[2:])
+
+
+def dn_name(n):
+    return "DN%02d" % n
+
+
+def dn_factor(n_from, n_to):
+    """Signal factor when going from DN n_from to DN n_to.  DNnn is a minimum-density setting of nn/10: the scanner
+    lengthens its exposure by 10^(nn/10), so one step is x1.26 and DN04 is 10^0.3 = 1.995x DN01."""
+    return 10.0 ** ((n_to - n_from) / 10.0)
 T_HI = 1.12               # legacy encoded ceiling (older calibrations/raw scans without a stored "t_hi")
 T_HI_MAX = 1.3            # ceiling for new scans: room for the ~8% pixel noise of near-blank film
 OUT_SCALE_NEW = 0.75      # new 16-bit scans: blank film -> 0.75 of full scale, so T_HI_MAX (1.3) -> 0.975
-T_LO_MIN = 0.002          # density 2.7: absolute floor of the encoded range
+T_LO_MIN = 0.0003         # density 3.5: absolute floor of the encoded range (the floor follows the exposure: 1/light)
 
 
 OUT_SCALE = 0.85          # legacy output scale (raw scans made before "out_scale" was stored)
 FILTERS = (("FR,R", "GM1T8"), ("FG,R", "GM2T8"), ("FB,R", "GM3T8"))
 CAL_NAME = "calibration.json"
+SENSOR_NAME = "sensor-profile.json"
+SENSOR_BLACK = 253.1      # holder level assumed when measuring the sensor pattern (the pattern is a ratio)
 
 
 def t_lo(black, blank):
@@ -70,6 +92,21 @@ def t_lo(black, blank):
 
 class ScsiError(Exception):
     pass
+
+
+def read_file(path, mode="r"):
+    with open(path, mode) as f:
+        return f.read()
+
+
+def load_json(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def save_json(obj, path, **kw):
+    with open(path, "w") as f:
+        json.dump(obj, f, **kw)
 
 
 class SgIoHdr(ctypes.Structure):
@@ -93,16 +130,266 @@ def find_scanner():
     for d in sorted(glob.glob("/sys/class/scsi_generic/sg*")):
         try:
             dev = os.path.join(d, "device")
-            if open(dev + "/type").read().strip() != "6":
+            if read_file(dev + "/type").strip() != "6":
                 continue
-            vendor = open(dev + "/vendor").read().strip()
-            model = open(dev + "/model").read().strip()
+            vendor = read_file(dev + "/vendor").strip()
+            model = read_file(dev + "/model").strip()
             hctl = os.path.basename(os.path.realpath(dev))
         except OSError:
             continue
         if vendor == "AGFA" and model == "VISION 35" and hctl.endswith(":0"):
             return "/dev/" + os.path.basename(d)
     return None
+
+
+class Display:
+    """Two-line live display.  Line 1: what is happening (stage, detail, progress, time).  Line 2: one progress bar
+    whose sections are coloured by the colour being scanned (red, green, blue; grey for preparation and processing).
+    Not live (output is not a terminal, or --plain): only the plain log lines are printed."""
+    SPIN = {True: "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", False: "|/-\\"}
+    EIGHTHS = " ▏▎▍▌▋▊▉"
+    HUE = {"R": ("\x1b[91m", "\x1b[31m"), "G": ("\x1b[92m", "\x1b[32m"), "B": ("\x1b[94m", "\x1b[34m"),
+           "grey": ("\x1b[97m", "\x1b[90m")}
+
+    def __init__(self, out=None):
+        self.out = out or sys.stdout
+        self.live, self.color, self.unicode, self.cols = False, True, True, None
+        self._reset()
+
+    def _reset(self):
+        self.segs, self.cur = [], -1
+        self.t0 = time.time()
+        self.stage = self.ctx = self.what = self.chan = ""
+        self.drawn = self.finished = self.hidden = False
+        self.last, self.spin = 0.0, 0
+
+    def configure(self, live, color=True, cols=None):
+        self.live, self.color, self.cols = bool(live), bool(color), cols
+        self.unicode = (getattr(self.out, "encoding", None) or "").lower().startswith("utf")
+
+    def start(self, plan, stage=""):
+        """plan: list of (label, kind, weight) with kind 'R', 'G', 'B' or 'grey'; weight = expected seconds."""
+        self._reset()
+        self.stage = stage
+        self.segs = [{"label": l, "kind": k, "w": float(w), "p": 0.0} for l, k, w in plan]
+        if self.live:
+            self.out.write("\x1b[?25l")
+            self.hidden = True
+            self._render()
+
+    def extend(self, plan):
+        self.segs += [{"label": l, "kind": k, "w": float(w), "p": 0.0} for l, k, w in plan]
+
+    def reweight(self, start, weights):
+        for k, w in enumerate(weights):
+            if start + k < len(self.segs):
+                self.segs[start + k]["w"] = float(w)
+
+    def next(self, label=None):
+        """Finish the current section and move to the next one."""
+        if 0 <= self.cur < len(self.segs):
+            self.segs[self.cur]["p"] = 1.0
+        self.cur += 1
+        if self.cur < len(self.segs):
+            self.segs[self.cur]["t0"] = time.time()
+            if label is not None:
+                self.segs[self.cur]["label"] = label
+        self.tick(True)
+
+    def _set(self, frac):
+        if 0 <= self.cur < len(self.segs):
+            self.segs[self.cur]["p"] = max(0.0, min(1.0, frac))
+            self.segs[self.cur]["explicit"] = True
+
+    @staticmethod
+    def _eff(sg):
+        """Progress of a section.  A grey section nobody reports on (start-up, autofocus, analysis) advances with
+        time towards its expected duration, so the bar keeps moving; it never shows more than 95% by itself."""
+        if sg["p"] < 1.0 and sg["kind"] == "grey" and not sg.get("explicit") and "t0" in sg:
+            return min(0.95, (time.time() - sg["t0"]) / max(1.0, sg["w"]))
+        return sg["p"]
+
+    def event(self, what):
+        self.what = what
+        self.tick()
+
+    def progress(self, frac, what=None):
+        self._set(frac)
+        if what is not None:
+            self.what = what
+        self.tick()
+
+    def lines(self, i, n):
+        self._set(i / float(max(1, n)))
+        self.what = "line %d/%d" % (i, n)
+        if self.live:
+            self.tick()
+        elif i % 200 == 0:
+            self.out.write("  %s line %d/%d  %.0fs\n" % (self.chan, i, n, time.time() - self.t0))
+            self.out.flush()
+
+    def say(self, text="", end="\n"):
+        """Print a message; a live display is kept at the bottom."""
+        if self.live and self.drawn and not self.finished:
+            self._erase()
+            self.out.write(text + end)
+            self._render()
+        else:
+            self.out.write(text + end)
+        self.out.flush()
+
+    def tick(self, force=False):
+        if self.live and not self.finished and (force or time.time() - self.last >= 0.1):
+            self._render()
+
+    def finish(self, what="done"):
+        for sg in self.segs:
+            sg["p"] = 1.0
+        self.stage, self.what, self.ctx = "Done", what, ""
+        if self.live:
+            self._render(final=True)
+        self.finished = True
+        self.close()
+
+    def close(self):
+        if self.hidden:
+            self.out.write("\x1b[?25h")
+            self.out.flush()
+            self.hidden = False
+
+    def _erase(self):
+        self.out.write("\x1b[2A\r\x1b[J")
+        self.drawn = False
+
+    def _render(self, final=False):
+        cols = self.cols or shutil.get_terminal_size((100, 24)).columns
+        l1, l2 = self._line1(cols, final), self._line2(cols)
+        if self.drawn:
+            self.out.write("\x1b[2A")
+        self.out.write("\r\x1b[2K" + l1 + "\n\r\x1b[2K" + l2 + "\n")
+        self.out.flush()
+        self.drawn = True
+        self.last = time.time()
+        self.spin += 1
+
+    @staticmethod
+    def fmt(sec):
+        sec = int(max(0, sec))
+        return "%d:%02d:%02d" % (sec // 3600, sec // 60 % 60, sec % 60) if sec >= 3600 else "%d:%02d" % (sec // 60, sec % 60)
+
+    def overall(self):
+        tot = sum(sg["w"] for sg in self.segs) or 1.0
+        return sum(sg["w"] * self._eff(sg) for sg in self.segs) / tot
+
+    def _line1(self, cols, final):
+        frac, el = self.overall(), time.time() - self.t0
+        right = "%3d%%  %s" % (round(100 * frac), self.fmt(el))
+        if not final and 0.03 <= frac < 1.0:
+            right += "  ~%s left" % self.fmt(el * (1 - frac) / frac)
+        spin = ("✔" if self.unicode else "*") if final else self.SPIN[self.unicode][self.spin % len(self.SPIN[self.unicode])]
+        text = ": ".join(t for t in (self.stage, self.ctx) if t)
+        if self.what:
+            text = (text + " — " if text else "") + self.what
+        left = "%s %s" % (spin, text)
+        room = cols - 1 - len(right) - 2
+        if len(left) > room:
+            left = left[:max(0, room - 1)] + ("…" if self.unicode else "~")
+        pad = " " * max(1, cols - 1 - len(left) - len(right))
+        if self.color:
+            return "\x1b[1m" + left + "\x1b[0m" + pad + "\x1b[2m" + right + "\x1b[0m"
+        return left + pad + right
+
+    @staticmethod
+    def alloc(weights, total):
+        """Integer cells per section, proportional to the weights (largest remainder), at least one each."""
+        s = sum(weights) or 1.0
+        raw = [w * total / s for w in weights]
+        base = [int(r) for r in raw]
+        if total >= len(weights):
+            base = [max(1, b) if w > 0 else b for b, w in zip(base, weights)]
+        rem = total - sum(base)
+        order = sorted(range(len(raw)), key=lambda i: raw[i] - int(raw[i]), reverse=True)
+        k = 0
+        while rem > 0 and order:
+            base[order[k % len(order)]] += 1
+            rem -= 1
+            k += 1
+        while rem < 0:
+            i = max(range(len(base)), key=lambda j: base[j])
+            base[i] -= 1
+            rem += 1
+        return base
+
+    def _line2(self, cols):
+        width = max(10, min(cols - 1, 120))
+        full, empty = ("█", "░") if self.unicode else ("#", "-")
+        if not self.segs:
+            return empty * width
+        out = []
+        for idx, (sg, n) in enumerate(zip(self.segs, self.alloc([x["w"] for x in self.segs], width))):
+            if n <= 0:
+                continue
+            filled = self._eff(sg) * n
+            whole, part = int(filled), int((filled - int(filled)) * 8)
+            bar = full * whole
+            if self.unicode and part and whole < n:
+                bar += self.EIGHTHS[part]
+            bar += empty * (n - len(bar))
+            if not self.color and idx > 0:
+                bar = "|" + bar[1:]                      # no colours: mark the section boundaries instead
+            on, off = self.HUE.get(sg["kind"], self.HUE["grey"])
+            if self.color:
+                k = whole + (1 if self.unicode and part and whole < n else 0)
+                out.append(on + bar[:k] + "\x1b[0m" + off + bar[k:] + "\x1b[0m")
+            else:
+                out.append(bar)
+        return "".join(out)
+
+
+UI = Display()
+
+
+def say(*args):
+    UI.say(" ".join(str(a) for a in args))
+
+
+CHAN_NAME = {"R": "red", "G": "green", "B": "blue"}
+PREP_S, WIDE_PASS_S, PROC_S = 14.0, 17.0, 40.0          # rough seconds: scanner start-up, wide pass, processing
+EXPO_K = (13.3, 6.6, 8.4)                                # ms of exposure per line at DN00 (R, G, B), measured
+
+
+def est_pass_seconds(c, dn):
+    """Rough time of a full-resolution pass (line time = max(17 ms, exposure time))."""
+    return SCAN_LINES * max(0.017, EXPO_K[c] / 1000.0 * 10 ** (dn / 10.0))
+
+
+def plan_wide(channels):
+    return [("prep", "grey", PREP_S)] + [("pre-" + "RGB"[c], "RGB"[c], WIDE_PASS_S) for c in channels]
+
+
+def plan_scan(channels, dns):
+    return [("prep", "grey", PREP_S)] + [("RGB"[c], "RGB"[c], est_pass_seconds(c, d)) for c, d in zip(channels, dns)]
+
+
+def friendly(cmd):
+    """Plain-language description of a scanner command, for the status line."""
+    if cmd.startswith("AF"):
+        return "autofocusing"
+    if cmd.startswith("MV"):
+        return "moving the carriage"
+    if len(cmd) == 4 and cmd[0] == "F" and cmd[2:] == ",R":
+        return "selecting the %s filter" % CHAN_NAME[cmd[1]]
+    if cmd.startswith("DN"):
+        return "setting the exposure (%s)" % cmd
+    if cmd.startswith("GM"):
+        return "selecting the exposure table"
+    if cmd.startswith("BXZ"):
+        return "starting the scan"
+    if cmd in ("PSOF", "PVOF"):
+        return "finishing"
+    if cmd in ("APIN", "OUT8"):
+        return "initialising"
+    return "configuring"
 
 
 class Scanner:
@@ -175,11 +462,13 @@ class Scanner:
         while not self.tur():
             if time.time() - t0 > timeout:
                 raise ScsiError("scanner busy for more than %.0f s" % timeout)
+            UI.tick()
             time.sleep(0.05)
 
     def send(self, text):
         if not ALLOWED_TEXT.match(text):
             raise ScsiError("text command %r is not one of the traced commands" % text)
+        UI.event(friendly(text))
         data = text.encode("ascii") + b"\r\n"
         L = len(data)
         st, hs, d, sb = self.cmd([0x2A, 0, 0, 0, 0, 0, 0, L >> 8, L & 0xFF, 0], data_out=data)
@@ -190,6 +479,7 @@ class Scanner:
         """Write table n (1..3): 'WGMnT,v0,...,v255' + CRLF, 256 values 0..255 (format verified experimentally)."""
         if n not in (1, 2, 3) or len(values) != 256 or not all(isinstance(v, int) and 0 <= v <= 255 for v in values):
             raise ScsiError("bad WGM table")
+        UI.event("loading the exposure table")
         data = ("WGM%dT," % n + ",".join(str(v) for v in values)).encode("ascii") + b"\r\n"
         L = len(data)
         st, hs, d, sb = self.cmd([0x2A, 0, 0, 0, 0, 0, 0, L >> 8, L & 0xFF, 0], data_out=data)
@@ -229,8 +519,7 @@ class Scanner:
                 end = (h, p)
                 break
             self.wait_ready()
-            if progress and i % 200 == 0:
-                progress(i, expect_lines)
+            UI.lines(i + 1, expect_lines)
         if end is None or end[1] != b"\x03":
             raise ScsiError("scan did not end with the expected end marker (got %d lines)" % len(lines))
         if len(lines) != expect_lines:
@@ -239,6 +528,8 @@ class Scanner:
 
     # ---- sequences (as in the trace, plus WGM tables) ----
     def preview(self, progress=None):
+        UI.stage = "Preview"
+        UI.next("prep")
         self._cmds(["APIN", "OUT8", "AF,R"]); self._status06("AF,R")
         self._cmds(["MP", "GML8", "IF15", "SPUP", "NHD", "AP50", "AVOF", "SDON", "DN01", "BRT0",
                     "CNT0", "SFT0"])
@@ -246,12 +537,19 @@ class Scanner:
         self.send("FG,R"); self._status06("FG,R")
         self._cmds(["GM1T8", "MV0,R"]); self._status06("MV0,R")
         self.send(PREVIEW_BXZ)
+        UI.next("preview")
+        UI.chan, UI.ctx = "G", "green filter"
         lines = self.read_lines(PREVIEW_W, PREVIEW_LINES, progress)
+        UI.ctx = ""
         self._cmds(["PSOF", "PVOF"])
         return lines
 
-    def wide_scan(self, channels, dns):
+    def wide_scan(self, channels, dns, stage=None):
         """Whole-frame step-13 pass per channel with neutral tables (used by calibration)."""
+        if stage:
+            UI.stage = stage
+        UI.next("prep")
+        UI.ctx = ""
         self._cmds(["APIN", "OUT8", "AF,R"]); self._status06("AF,R")
         self._cmds(["MP", "GML8", "IF15", "SPUP", "NHD", "AP50", "AVOF", "SDON", dns[0], "BRT0", "CNT0", "SFT0"])
         for i in channels:
@@ -263,11 +561,39 @@ class Scanner:
             self.send(f); self._status06(f)
             self.send(g); self.send("MV0,R"); self._status06("MV0,R")
             self.send(PREVIEW_BXZ)
+            UI.next()
+            UI.chan, UI.ctx = "RGB"[i], "%s at %s" % (CHAN_NAME["RGB"[i]], dns[k])
             out.append(self.read_lines(PREVIEW_W, PREVIEW_LINES))
+        UI.ctx = ""
         self._cmds(["PSOF", "PVOF"])
         return out
 
+    def open_light_scan(self, channels, progress=None):
+        """Full-window scan of the EMPTY holder at DN00 (lowest exposure) with neutral tables: sensor pattern data."""
+        UI.stage = "Sensor calibration"
+        UI.next("prep")
+        self._cmds(["PSOF", "PVOF", "IF15", "INM", "APIN", "OUT8", "AF,R"]); self._status06("AF,R")
+        self._cmds(["CP", "GML8", "IF15", "SPUP", "NHD", "AP50", "AVOF", "SDON", "DN00", "BRT0", "CNT0", "SFT0"])
+        for i in channels:
+            self.send_table(i + 1, IDENTITY)
+        planes = []
+        for i in channels:
+            f, g = FILTERS[i]
+            self.send("DN00")
+            self.send(f); self._status06(f)
+            self.send(g); self.send("MV345,R"); self._status06("MV345,R")
+            self.send(SCAN_BXZ)
+            UI.next()
+            UI.chan, UI.ctx = "RGB"[i], "%s, empty holder at DN00" % CHAN_NAME["RGB"[i]]
+            planes.append(self.read_lines(SCAN_W, SCAN_LINES))
+        UI.ctx = ""
+        self._cmds(["PSOF", "PVOF", "IF15", "INM"])
+        return planes
+
     def full_scan(self, channels, dns, tables, progress=None):
+        UI.stage = "Scanning"
+        UI.next("prep")
+        UI.ctx = ""
         self._cmds(["PSOF", "PVOF", "IF15", "INM", "APIN", "OUT8", "AF,R"]); self._status06("AF,R")
         self._cmds(["CP", "GML8", "IF15", "SPUP", "NHD", "AP50", "AVOF", "SDON", dns[0], "BRT0", "CNT0", "SFT0"])
         for k, i in enumerate(channels):
@@ -279,9 +605,12 @@ class Scanner:
             self.send(f); self._status06(f)
             self.send(g); self.send("MV345,R"); self._status06("MV345,R")
             self.send(SCAN_BXZ)
-            name = "RGB"[i]
-            planes.append(self.read_lines(SCAN_W, SCAN_LINES,
-                                          (lambda a, b, n=name: progress and progress(a, b, n))))
+            UI.next()
+            UI.chan = "RGB"[i]
+            UI.ctx = "%s%s at %s" % (CHAN_NAME["RGB"[i]],
+                                     " pass %d/%d" % (k + 1, len(channels)) if len(channels) > 1 else "", dns[k])
+            planes.append(self.read_lines(SCAN_W, SCAN_LINES))
+        UI.ctx = ""
         self._cmds(["PSOF", "PVOF", "IF15", "INM"])
         return planes
 
@@ -519,14 +848,157 @@ def levels_at(S, reg):
     return black, blank, profs
 
 
+def sensor_pattern(lines, black=SENSOR_BLACK, k=15, margin=100):
+    """Multiplicative response pattern of the sensor along the line (one value per sample, ~1.0), from lines of an
+    empty-holder scan: row means over the lines, divided by their own moving average (symmetric window, 2k+1 rows).
+    The slow part (lamp falloff) is left to the calibration profile.  Returns (pattern, saturated_fraction)."""
+    body = lines[margin:len(lines) - margin]
+    n = len(body[0]) - 1
+    acc = [0] * n
+    sat = 0
+    for ln in body:
+        acc = [a + v for a, v in zip(acc, ln[:n])]
+        sat += ln[:n].count(0) + ln[:n].count(1) + ln[:n].count(2)
+    light = [black - a / len(body) for a in acc]
+    pat = []
+    for i in range(n):
+        half = min(k, i, n - 1 - i)
+        seg = light[i - half:i + half + 1]
+        pat.append(light[i] / (sum(seg) / len(seg)))
+    return pat, sat / float(len(body) * n)
+
+
+def dark_level(levels, dn):
+    """Dark (zero-light) level at DN number dn, linearly interpolated between the measured DN settings.
+    levels: {'DN00': v, 'DN04': v, ...}."""
+    pts = sorted((int(k[2:]), v) for k, v in levels.items())
+    if dn <= pts[0][0]:
+        return pts[0][1]
+    for (a, va), (b, vb) in zip(pts, pts[1:]):
+        if dn <= b:
+            return va + (vb - va) * (dn - a) / float(b - a)
+    return pts[-1][1]
+
+
+def cal_black(c):
+    """Black (zero-light) level used for the tables/decoding of a scan: the measured dark level when available."""
+    return c.get("black_scan", c["black"])
+
+
+def dark_levels_from_wide(S):
+    """Per channel mean signal inside the aperture of a wide scan taken with something opaque (foil) in the holder."""
+    out = []
+    for c in range(len(S)):
+        vals = [S[c][y][x] for y in range(25, 220) for x in range(40, 350)]
+        out.append(sum(vals) / len(vals))
+    return out
+
+
+def sensor_profile_paths(explicit=None):
+    paths = [explicit] if explicit else [
+        os.path.join(".", SENSOR_NAME),
+        os.path.join(os.path.expanduser("~"), ".config", "vision35", SENSOR_NAME),
+        os.path.join("/usr/local/share/vision35", SENSOR_NAME)]
+    return paths
+
+
+def load_sensor_profile(explicit=None):
+    """First existing sensor profile -> ({'G': [...], 'B': [...]}, path) or ({}, None)."""
+    for path in sensor_profile_paths(explicit):
+        try:
+            data = load_json(path)
+        except (OSError, ValueError):
+            continue
+        return {k: v["pattern"] for k, v in data.get("channels", {}).items() if v.get("pattern")}, path
+    return {}, None
+
+
+def load_dark_levels(explicit=None):
+    """Dark levels per channel ({'R': {'DN00': v, ...}, ...}) from the first sensor profile that has them."""
+    for path in sensor_profile_paths(explicit):
+        try:
+            data = load_json(path)
+        except (OSError, ValueError):
+            continue
+        if data.get("dark"):
+            return data["dark"], path
+    return {}, None
+
+
+def calibrate_dark(sc, path, log=say):
+    log("dark calibration: scanning with the aperture COVERED (e.g. two layers of foil) at several exposures ...")
+    levels = {"R": {}, "G": {}, "B": {}}
+    for dn in ("DN00", "DN04", "DN08", "DN12"):
+        S = wide_arrays(sc.wide_scan((0, 1, 2), [dn] * 3, "Dark calibration (%s)" % dn))
+        means = dark_levels_from_wide(S)
+        for c, m in enumerate(means):
+            if m < 250.0:
+                raise ScsiError("%s is not dark at %s (mean signal %.1f): is the aperture fully covered and light-tight?"
+                                % ("RGB"[c], dn, m))
+            levels["RGB"[c]][dn] = round(m, 3)
+        log("  %s: dark level R %.2f  G %.2f  B %.2f" % (dn, means[0], means[1], means[2]))
+    try:
+        data = load_json(path)
+    except (OSError, ValueError):
+        data = {"version": 1, "scanner": "AGFA VISION 35", "channels": {}}
+    data["dark"] = levels
+    data["dark_created"] = datetime.datetime.now().isoformat(timespec="seconds")
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    save_json(data, path)
+    log("saved dark levels into %s" % path)
+    UI.finish("dark levels saved")
+
+
+def calibrate_sensor(sc, path, log=say):
+    log("sensor calibration: scanning the EMPTY film holder at DN00 (green and blue; red saturates) ...")
+    channels = (1, 2)
+    planes = sc.open_light_scan(channels)
+    UI.next("analysing")
+    UI.chan, UI.ctx = "", ""
+    UI.event("computing the sensor pattern")
+    out = {}
+    for c, lines in zip(channels, planes):
+        sample = [v for ln in lines[200:4200:50] for v in ln[200:2700:9]]
+        mean_s = sum(sample) / len(sample)
+        if mean_s > 150:
+            raise ScsiError("the aperture is not bright (mean signal %.0f): is a film still in the holder? "
+                            "remove the film (keep the holder) and try again" % mean_s)
+        pat, sat = sensor_pattern(lines)
+        if sat > 0.01:
+            raise ScsiError("%s saturates at the lowest exposure (%.1f%% of pixels); cannot measure it" % ("RGB"[c], 100 * sat))
+        rms = (sum((v - 1.0) ** 2 for v in pat) / len(pat)) ** 0.5
+        log("  %s: mean light %.0f, pattern rms %.2f%%, peak-to-peak %.1f%%" % (
+            "RGB"[c], SENSOR_BLACK - mean_s, 100 * rms, 100 * (max(pat) - min(pat))))
+        out["RGB"[c]] = {"dn": "DN00", "mean_light": round(SENSOR_BLACK - mean_s, 1),
+                         "pattern": [round(v, 5) for v in pat]}
+    data = {"version": 1, "created": datetime.datetime.now().isoformat(timespec="seconds"),
+            "scanner": "AGFA VISION 35", "samples": SCAN_W - 1,
+            "note": "multiplicative sensor pattern along the line; red could not be measured", "channels": out}
+    try:                                           # keep dark levels measured earlier with calibrate-dark
+        old = load_json(path)
+        if old.get("dark"):
+            data["dark"] = old["dark"]
+            data["dark_created"] = old.get("dark_created")
+    except (OSError, ValueError):
+        pass
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    save_json(data, path)
+    log("saved %s" % path)
+    UI.finish("sensor profile saved")
+
+
 def row_factor(calc, i):
     """Flat-field factor for scan sample row i: nominal (clearest) blank light / blank light at this row."""
     p = calc.get("profile")
-    if not p:
-        return 1.0
-    k = (135 + i) / 13.0                          # scan sample i is scanner y = 135+i; preview rows are every 13
-    nom = calc["black"] - calc["blank"]
-    return nom / max(calc["black"] - prof_level(p, k), 0.2 * nom)
+    f = 1.0
+    if p:
+        k = (135 + i) / 13.0                      # scan sample i is scanner y = 135+i; preview rows are every 13
+        nom = calc["black"] - calc["blank"]
+        f = nom / max(calc["black"] - prof_level(p, k), 0.2 * nom)
+    pat = calc.get("pattern")                     # sensor pattern (empty-holder measurement), if available
+    if pat and 0 <= i < len(pat):
+        f /= pat[i]
+    return f
 
 
 def write_png_rgb(path, rows, w, h):
@@ -534,13 +1006,17 @@ def write_png_rgb(path, rows, w, h):
 
     def k(t, d):
         return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
-    open(path, "wb").write(b"\x89PNG\r\n\x1a\n" + k(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
-                           + k(b"IDAT", zlib.compress(raw, 3)) + k(b"IEND", b""))
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + k(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+                + k(b"IDAT", zlib.compress(raw, 3)) + k(b"IEND", b""))
 
 
-def calibrate(sc, outdir, log=print):
+def calibrate(sc, outdir, log=say):
     log("calibration: wide scan at DN01 ...")
-    S1 = wide_arrays(sc.wide_scan((0, 1, 2), ["DN01"] * 3))
+    S1 = wide_arrays(sc.wide_scan((0, 1, 2), ["DN01"] * 3, "Calibration"))
+    UI.next("analysing")
+    UI.chan, UI.ctx = "", ""
+    UI.event("looking for the film holder and the blank film")
     os.makedirs(outdir, exist_ok=True)
     try:
         reg = detect_regions(S1)
@@ -559,24 +1035,36 @@ def calibrate(sc, outdir, log=print):
         if black1[c] - blank1[c] < 15:
             raise ScsiError("calibration failed: blank film is not clearly lighter than the holder in %s "
                             "(black %.1f, blank %.1f)" % ("RGB"[c], black1[c], blank1[c]))
-    # per channel: DN04 (2.04x gain, better precision) when the blank film still fits below the clip point
-    use04 = [c for c in range(3) if (black1[c] - blank1[c]) * DN_GAIN * T_HI <= black1[c] - 6]
+    # per channel: the highest exposure step (DN) that keeps the blank film, with headroom, below saturation
+    dns = []
+    for c in range(3):
+        L1 = black1[c] - blank1[c]
+        n = 1
+        while n < DN_MAX and L1 * dn_factor(1, n + 1) * T_HI_MAX <= black1[c] - 6:
+            n += 1
+        dns.append(n)
     cal = {c: {"dn": "DN01", "black": black1[c], "blank": blank1[c], "profile": prof1[c]} for c in range(3)}
-    if use04:
-        log("calibration: wide scan at DN04 for channels %s ..." % "".join("RGB"[c] for c in use04))
-        S4 = wide_arrays(sc.wide_scan(use04, ["DN04"] * len(use04)))
+    use = [c for c in range(3) if dns[c] > 1]
+    if use:
+        log("calibration: wide scan with more exposure for %s (%s) ..." % (
+            "".join("RGB"[c] for c in use), ", ".join(dn_name(dns[c]) for c in use)))
+        UI.extend(plan_wide(use))
+        S4 = wide_arrays(sc.wide_scan(use, [dn_name(dns[c]) for c in use], "Calibration (more exposure)"))
         black4, blank4, prof4 = levels_at(S4, reg)
-        for k, c in enumerate(use04):
-            pred = black1[c] - (black1[c] - blank1[c]) * DN_GAIN
-            log("  %s at DN04: black %.1f, blank %.1f (predicted from DN01: %.1f)" % ("RGB"[c], black4[k], blank4[k], pred))
-            if abs(blank4[k] - pred) <= 10 and blank4[k] > 8 and black4[k] - blank4[k] > 30:
-                cal[c] = {"dn": "DN04", "black": black4[k], "blank": blank4[k], "profile": prof4[k]}
+        for k, c in enumerate(use):
+            pred = black1[c] - (black1[c] - blank1[c]) * dn_factor(1, dns[c])
+            log("  %s at %s: black %.1f, blank %.1f (predicted from DN01: %.1f)" % (
+                "RGB"[c], dn_name(dns[c]), black4[k], blank4[k], pred))
+            if abs(blank4[k] - pred) <= 0.06 * (black1[c] - pred) + 3 and blank4[k] > 8 and black4[k] - blank4[k] > 30:
+                cal[c] = {"dn": dn_name(dns[c]), "black": black4[k], "blank": blank4[k], "profile": prof4[k]}
+            else:
+                log("  %s: measurement does not match the gain law, staying at DN01" % "RGB"[c])
     data = {"version": 2, "created": datetime.datetime.now().isoformat(timespec="seconds"),
             "scanner": "AGFA VISION 35", "blank_columns_preview": [a, b],
             "channels": {"RGB"[c]: cal[c] for c in range(3)}}
     os.makedirs(outdir, exist_ok=True)
     path = os.path.join(outdir, CAL_NAME)
-    json.dump(data, open(path, "w"), indent=1)
+    save_json(data, path, indent=1)
     # picture of the wide scan (raw signal) with the detected blank film tinted green, to eyeball the result
     bp = set(reg["blank_pts"])
     H, Wd = len(S1[0]), len(S1[0][0])
@@ -598,12 +1086,47 @@ def calibrate(sc, outdir, log=print):
             "RGB"[c], d["dn"], d["black"], d["blank"], d["black"] - d["blank"],
             100 * ends[0] / (d["black"] - d["blank"]), 100 * ends[1] / (d["black"] - d["blank"])))
     log("saved %s (and calibration-scan.png, detected blank film tinted green)" % path)
+    UI.finish("calibration saved")
     return data
+
+
+def cal_blank(c):
+    """Blank-film level used for the tables/decoding of a scan: a 'virtual' level when the scan's DN differs from
+    the calibrated one (the gain law scales the light), else the calibrated level."""
+    return c.get("blank_scan", c["blank"])
+
+
+def frame_clear_levels(S, blacks, exclude=None):
+    """Light (black - s) of the clearest 0.1% of the picture inside the full-scan window, per channel, from a wide
+    scan S[c][y][x] (neutral tables).  exclude = (a, b): wide-scan columns holding the blank film that was used for
+    calibration (a leader offset into the window): they are left out, because blank film is not picture.  Ignored
+    when the blank area covers most of the window (a fully blank frame)."""
+    x0, x1 = int(345 / 13) + 2, int(4757 / 13) - 2
+    y0, y1 = int(135 / 13) + 2, int(3015 / 13) - 2
+    xs = list(range(x0, x1))
+    if exclude is not None and (exclude[1] - exclude[0]) < 0.5 * len(xs):
+        xs = [x for x in xs if not (exclude[0] - 2 <= x <= exclude[1] + 2)]
+    out = []
+    for c in range(len(S)):
+        vals = sorted(S[c][y][x] for y in range(y0, y1) for x in xs)
+        out.append(blacks[c] - vals[int(len(vals) * 0.001)])
+    return out
+
+
+def choose_exposure(dn_cal, light_cal, black, light_frame, headroom=EXPOSURE_HEADROOM, dn_max=DN_MAX):
+    """Highest DN at which the frame's clearest area (x headroom) still stays below saturation.
+    light_cal: blank-film light at the calibrated DN; light_frame: clearest-area light measured at the same DN."""
+    n = dn_cal
+    while n > 1 and light_frame * headroom * dn_factor(dn_cal, n) > black - 4.0:
+        n -= 1
+    while n < dn_max and light_frame * headroom * dn_factor(dn_cal, n + 1) <= black - 4.0:
+        n += 1
+    return n
 
 
 def load_calibration(path, channels):
     try:
-        data = json.load(open(path))
+        data = load_json(path)
     except OSError:
         raise ScsiError("no calibration found (%s). Show a piece of blank film and run: scan calibrate" % path)
     cal = {}
@@ -687,26 +1210,28 @@ def rows_through(rows, nch, maps):
 _LUT_CACHE = {}
 
 
-def decode_rows(rows, nch, channels, cal, row0, sixteen):
+def decode_rows(rows, nch, channels, cal, row0, sixteen, report=None):
     """Decode y-byte rows to transmittance relative to the local blank film (flat-fielded per row).
     row0 = index of rows[0] in the uncropped scan.  16-bit LE (sixteen) or 8-bit display output."""
     dms, scales = [], []
     for i in channels:
         c = cal[i]
         th = c.get("t_hi", T_HI)
-        dms.append(decode_map(c["black"], c["blank"], build_table(c["black"], c["blank"], th), th))
+        dms.append(decode_map(cal_black(c), cal_blank(c), build_table(cal_black(c), cal_blank(c), th), th))
         scales.append(c.get("out_scale", OUT_SCALE))
     out = []
     for n, r in enumerate(rows):
         idx = row0 + n
+        if report and n % 64 == 0:
+            report(n / float(len(rows)))
         if sixteen:
             b = bytearray(len(r) * 2)
             for k, i in enumerate(channels):
                 f = row_factor(cal[i], idx)
-                key = (id(dms[k]), int(f * 400), 16, scales[k])
+                key = (id(dms[k]), int(f * 4000), 16, scales[k])
                 lut = _LUT_CACHE.get(key)
                 if lut is None:
-                    pairs = [t16_map(T * (int(f * 400) / 400.0), scales[k]) for T in dms[k]]
+                    pairs = [t16_map(T * (int(f * 4000) / 4000.0), scales[k]) for T in dms[k]]
                     lut = _LUT_CACHE[key] = (bytes(q[0] for q in pairs), bytes(q[1] for q in pairs))
                 ch = r[k::nch]
                 b[2 * k::2 * nch] = ch.translate(lut[0])
@@ -716,10 +1241,10 @@ def decode_rows(rows, nch, channels, cal, row0, sixteen):
             b = bytearray(len(r))
             for k, i in enumerate(channels):
                 f = row_factor(cal[i], idx)
-                key = (id(dms[k]), int(f * 400), 8, scales[k])
+                key = (id(dms[k]), int(f * 4000), 8, scales[k])
                 lut = _LUT_CACHE.get(key)
                 if lut is None:
-                    lut = _LUT_CACHE[key] = bytes(t8_map(T * (int(f * 400) / 400.0), scales[k]) for T in dms[k])
+                    lut = _LUT_CACHE[key] = bytes(t8_map(T * (int(f * 4000) / 4000.0), scales[k]) for T in dms[k])
                 b[k::nch] = r[k::nch].translate(lut)
             out.append(bytes(b))
     return out
@@ -908,17 +1433,24 @@ def clip_report(rows, nch, names, los, his):
         for r in rows[::7]:
             ch = r[c::nch]
             lo += ch.count(0); hi += ch.count(255); tot += len(ch)
-        print("  %s: %.2f%% denser than T=%.2f (floor), %.2f%% clearer than %.2fx blank (ceiling)" % (
+        say("  %s: %.2f%% denser than T=%.2f (floor), %.2f%% clearer than %.2fx blank (ceiling)" % (
             names[c], 100.0 * lo / tot, los[c], 100.0 * hi / tot, his[c]))
         if 100.0 * hi / tot > 0.5:
-            print("     warning: %s has areas clearer than the calibrated blank film; recalibrate with the "
+            say("     warning: %s has areas clearer than the calibrated blank film; recalibrate with the "
                   "clearest film available" % names[c])
 
 
 def main():
+    try:
+        _main()
+    finally:
+        UI.close()                      # always give the terminal cursor back
+
+
+def _main():
     ap = argparse.ArgumentParser(prog="scan", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action="version", version="scan " + __version__)
-    ap.add_argument("command", nargs="?", choices=("scan", "calibrate"), default="scan")
+    ap.add_argument("command", nargs="?", choices=("scan", "calibrate", "calibrate-sensor", "calibrate-dark"), default="scan")
     ap.add_argument("--preview", action="store_true", help="low-res greyscale preview instead of a full scan")
     ap.add_argument("--out", help="output file (default: next free N.tiff in --dir)")
     ap.add_argument("--dir", default=".", help="folder for output files and calibration.json (default: current folder)")
@@ -940,12 +1472,26 @@ def main():
     ap.add_argument("--flip-h", action="store_true",
                     help="mirror left-to-right (needed if text in the picture reads backwards, i.e. the strip is in "
                          "the holder emulsion-side the other way)")
+    ap.add_argument("--no-auto-exposure", action="store_true",
+                    help="scan at the calibrated exposure instead of measuring the frame first")
+    ap.add_argument("--exposure", type=int, metavar="STEPS",
+                    help="shift the exposure by STEPS DN steps (x1.26 each, may be negative) relative to the calibrated "
+                         "one instead of auto-exposure")
+    ap.add_argument("--sensor-profile", metavar="FILE",
+                    help="sensor pattern file (default: ./%s, ~/.config/vision35/%s, /usr/local/share/vision35/%s); "
+                         "also where `calibrate-sensor` writes (default ~/.config/vision35/%s)" % ((SENSOR_NAME,) * 4))
+    ap.add_argument("--no-sensor-profile", action="store_true", help="do not apply the sensor pattern correction")
+    ap.add_argument("--plain", action="store_true",
+                    help="plain log lines instead of the live two-line status display (also used automatically "
+                         "when the output is not a terminal; NO_COLOR turns the colours off)")
     ap.add_argument("--no-trim", action="store_true", help="do not trim the film holder")
     ap.add_argument("--device", help="sg device (default: auto-detect AGFA VISION 35)")
     ap.add_argument("--keep-raw", action="store_true", help="also save <out>.raw + <out>.json (for --from-scan)")
     ap.add_argument("--from-scan", metavar="FILE.raw", help="re-process a saved raw scan instead of scanning")
     a = ap.parse_args()
 
+    UI.configure(live=sys.stdout.isatty() and not a.plain and os.environ.get("TERM") != "dumb",
+                 color="NO_COLOR" not in os.environ)
     if a.positive:
         a.output, a.invert, a.auto_levels = "display", True, True
     os.makedirs(os.path.expanduser("~/scanner_log"), exist_ok=True)
@@ -957,11 +1503,31 @@ def main():
             sys.exit("AGFA VISION 35 not found (check cabling, power-on order, SCSI ID and the sym53c8xx driver)")
         sc = Scanner(dev, logpath)
         iq = sc.inquiry()
-        print("scanner: %s on %s" % (iq[8:36].decode("ascii", "replace"), dev), flush=True)
+        say("scanner: %s on %s" % (iq[8:36].decode("ascii", "replace"), dev))
         return sc
+
+    if a.command == "calibrate-dark":
+        sc = open_scanner()
+        UI.start(sum([plan_wide((0, 1, 2)) for _ in range(4)], []), "Dark calibration")
+        try:
+            calibrate_dark(sc, a.sensor_profile or sensor_profile_paths()[1])
+        except ScsiError as e:
+            sys.exit("error: %s\n(log: %s)" % (e, logpath))
+        return
+
+    if a.command == "calibrate-sensor":
+        sc = open_scanner()
+        UI.start([("prep", "grey", PREP_S), ("G", "G", 75.0), ("B", "B", 110.0), ("analysing", "grey", 12.0)],
+                 "Sensor calibration")
+        try:
+            calibrate_sensor(sc, a.sensor_profile or sensor_profile_paths()[1])
+        except ScsiError as e:
+            sys.exit("error: %s\n(log: %s)" % (e, logpath))
+        return
 
     if a.command == "calibrate":
         sc = open_scanner()
+        UI.start(plan_wide((0, 1, 2)) + [("analysing", "grey", 10.0)], "Calibration")
         try:
             calibrate(sc, a.dir)
         except ScsiError as e:
@@ -977,45 +1543,92 @@ def main():
     sixteen = (a.output == "negpy") and not a.preview
 
     if a.from_scan:
-        meta = json.load(open(a.from_scan[:-4] + ".json" if a.from_scan.endswith(".raw") else a.from_scan + ".json"))
+        UI.start([("process", "grey", PROC_S)], "Reprocessing")
+        meta = load_json(a.from_scan[:-4] + ".json" if a.from_scan.endswith(".raw") else a.from_scan + ".json")
         channels = tuple(meta["channels"])
         if len(channels) == 1 and not a.mono:
             a.mono = "RGB"[channels[0]]
         cal = {int(k): v for k, v in meta["calibration"].items()}
-        raw = open(a.from_scan, "rb").read()
+        if not a.no_sensor_profile:               # a sensor profile measured later can be applied to an old scan
+            patterns, _ = load_sensor_profile(a.sensor_profile)
+            for i in channels:
+                if "RGB"[i] in patterns and "pattern" not in cal[i]:
+                    cal[i]["pattern"] = patterns["RGB"[i]]
+        raw = read_file(a.from_scan, "rb")
         planes = [[raw[c * SCAN_W * SCAN_LINES + i:c * SCAN_W * SCAN_LINES + i + SCAN_W]
                    for i in range(0, SCAN_W * SCAN_LINES, SCAN_W)] for c in range(len(channels))]
         width = SCAN_W
     else:
         sc = open_scanner()
-        t0 = time.time()
-
-        def progress(i, n, ch=""):
-            print("  %s line %d/%d  %.0fs" % (ch, i, n, time.time() - t0), flush=True)
         try:
             if a.preview:
-                planes, width = [sc.preview(progress)], PREVIEW_W
+                UI.start([("prep", "grey", PREP_S), ("preview", "G", 25.0), ("process", "grey", 8.0)], "Preview")
+                planes, width = [sc.preview()], PREVIEW_W
             else:
                 data, cal = load_calibration(calpath, channels)
-                print("calibration %s (%s): %s" % (calpath, data.get("created", "?"), ", ".join(
+                say("calibration %s (%s): %s" % (calpath, data.get("created", "?"), ", ".join(
                     "%s %s black %.1f blank %.1f" % ("RGB"[i], cal[i]["dn"], cal[i]["black"], cal[i]["blank"]) for i in channels)))
+                if not a.no_sensor_profile:
+                    patterns, ppath = load_sensor_profile(a.sensor_profile)
+                    got = [("RGB"[i]) for i in channels if "RGB"[i] in patterns]
+                    for i in channels:
+                        if "RGB"[i] in patterns:
+                            cal[i]["pattern"] = patterns["RGB"[i]]
+                    say("sensor pattern correction: %s" % (("%s (%s)" % ("".join(got), ppath)) if got else
+                        "none (run `scan calibrate-sensor` with an empty holder to measure it)"))
+                dn_scan = {i: dn_number(cal[i]["dn"]) for i in channels}
+                if a.exposure is not None:
+                    for i in channels:
+                        dn_scan[i] = max(1, min(DN_MAX, dn_scan[i] + a.exposure))
+                auto = a.exposure is None and not a.no_auto_exposure
+                plan = ((plan_wide(channels) if auto else []) + plan_scan(channels, [dn_scan[i] for i in channels])
+                        + [("process", "grey", PROC_S if len(channels) > 1 else 22.0)])
+                UI.start(plan, "Pre-scan" if auto else "Scanning")
+                if auto:
+                    S = wide_arrays(sc.wide_scan(channels, [cal[i]["dn"] for i in channels], "Pre-scan: measuring the frame"))
+                    lights = frame_clear_levels(S, [cal[i]["black"] for i in channels],
+                                                tuple(data["blank_columns_preview"]) if data.get("blank_columns_preview") else None)
+                    for k, i in enumerate(channels):
+                        L_cal = cal[i]["black"] - cal[i]["blank"]
+                        dn_scan[i] = choose_exposure(dn_number(cal[i]["dn"]), L_cal, cal[i]["black"], lights[k])
+                        say("  %s: clearest area %.2f x blank film -> %s (calibrated %s)" % (
+                            "RGB"[i], lights[k] / L_cal, dn_name(dn_scan[i]), cal[i]["dn"]))
+                    UI.reweight(len(plan_wide(channels)) + 1, [est_pass_seconds(i, dn_scan[i]) for i in channels])
+                dark = {}
+                if not a.no_sensor_profile:
+                    dark, dpath = load_dark_levels(a.sensor_profile)
+                    say("dark levels: %s" % (("%s" % dpath) if dark else
+                        "none (run `scan calibrate-dark` with the aperture covered; the holder reading is used)"))
                 for i in channels:      # per-scan encoding parameters; stored with --keep-raw so the scan decodes exactly
-                    cal[i]["t_hi"] = round(min(T_HI_MAX, (cal[i]["black"] - 3.0) / (cal[i]["black"] - cal[i]["blank"])), 4)
+                    n0 = dn_number(cal[i]["dn"])
+                    if "RGB"[i] in dark:   # true zero-light level (foil), not the holder, whose reading stray light lowers
+                        b_cal = dark_level(dark["RGB"[i]], n0); b_scan = dark_level(dark["RGB"[i]], dn_scan[i])
+                    else:
+                        b_cal = b_scan = cal[i]["black"]
+                    L_virtual = (b_cal - cal[i]["blank"]) * dn_factor(n0, dn_scan[i])
+                    cal[i]["dn_scan"] = dn_scan[i]
+                    cal[i]["black_scan"] = round(b_scan, 3)
+                    cal[i]["blank_scan"] = b_scan - L_virtual
+                    cal[i]["t_hi"] = round(min(T_HI_MAX, (b_scan - 3.0) / L_virtual), 4)
                     cal[i]["out_scale"] = OUT_SCALE_NEW
-                tables = [build_table(cal[i]["black"], cal[i]["blank"], cal[i]["t_hi"]) for i in channels]
-                dns = [cal[i]["dn"] for i in channels]
-                planes, width = sc.full_scan(channels, dns, tables, progress), SCAN_W
+                tables = [build_table(cal_black(cal[i]), cal_blank(cal[i]), cal[i]["t_hi"]) for i in channels]
+                dns = [dn_name(dn_scan[i]) for i in channels]
+                planes, width = sc.full_scan(channels, dns, tables), SCAN_W
         except ScsiError as e:
             sys.exit("error: %s\n(log: %s)" % (e, logpath))
 
     names = "".join("RGB"[i] for i in channels)
     nch = len(planes)
+    UI.next("process")
+    UI.stage, UI.ctx, UI.chan = "Processing", "", ""
+    UI.progress(0.0, "assembling the picture")
     w, h, rows = assemble(planes, width)
     value = 255 if a.preview else 0               # preview table saturates the holder to 255; scans floor it at 0
     row0 = 0
     if not a.no_trim:
+        UI.progress(0.12, "trimming the film holder")
         box = holder_trim(w, h, rows, nch, value)
-        print("holder trim: x %d..%d, y %d..%d of %dx%d" % (box[0], box[2], box[1], box[3], w, h))
+        say("holder trim: x %d..%d, y %d..%d of %dx%d" % (box[0], box[2], box[1], box[3], w, h))
         rows = crop(rows, nch, box)
         row0 = box[1]
         w, h = box[2] - box[0], box[3] - box[1]
@@ -1024,9 +1637,11 @@ def main():
     if a.preview:
         rows = auto_levels(rows, nch, 1.0)        # mild software stretch on top of the fixed preview table
     else:
-        clip_report(rows, nch, names, [t_lo(cal[i]["black"], cal[i]["blank"]) for i in channels],
+        clip_report(rows, nch, names, [t_lo(cal_black(cal[i]), cal_blank(cal[i])) for i in channels],
                     [cal[i].get("t_hi", T_HI) for i in channels])
-        rows = decode_rows(rows, nch, channels, cal, row0, sixteen)
+        UI.progress(0.2, "decoding to transmittance")
+        rows = decode_rows(rows, nch, channels, cal, row0, sixteen,
+                           lambda f: UI.progress(0.2 + 0.55 * f, "decoding to transmittance"))
         if sixteen:
             bps = 16
         else:
@@ -1034,6 +1649,7 @@ def main():
                 rows = invert(rows)
             if a.auto_levels:
                 rows = auto_levels(rows, nch, a.gamma)
+    UI.progress(0.78, "orienting the picture")
     flip_v = not a.no_flip
     if a.rotate or a.flip_h or flip_v:
         rows, w, h = orient(rows, w, h, nch * (bps // 8), a.rotate, a.flip_h, flip_v)
@@ -1053,15 +1669,16 @@ def main():
     else:
         os.makedirs(a.dir, exist_ok=True)
         out = next_numbered(a.dir, "preview-" if a.preview else "")
+    UI.progress(0.85, "writing %s" % os.path.basename(out))
     write_tiff(out, w, h, rows, nch, bps)
     if a.keep_raw and not a.from_scan and not a.preview:
         with open(out + ".raw", "wb") as f:
             for p in planes:
                 f.write(b"".join(p))
-        json.dump({"channels": list(channels), "calibration": {str(k): v for k, v in cal.items()}},
-                  open(out + ".json", "w"))
-    print("wrote %s (%dx%d, %s %d-bit%s)" % (out, w, h, "RGB" if nch == 3 else "grey", bps,
-                                              ", linear transmittance" if sixteen else ""))
+        save_json({"channels": list(channels), "calibration": {str(k): v for k, v in cal.items()}}, out + ".json")
+    UI.finish("saved %s" % os.path.basename(out))
+    say("wrote %s (%dx%d, %s %d-bit%s)" % (out, w, h, "RGB" if nch == 3 else "grey", bps,
+                                           ", linear transmittance" if sixteen else ""))
 
 
 if __name__ == "__main__":

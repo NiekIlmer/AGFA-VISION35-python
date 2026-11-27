@@ -38,10 +38,13 @@ Make one folder per roll and work inside it:
 mkdir roll-01 && cd roll-01
 
 scan calibrate            # film holder + a piece of BLANK film in view -> calibration.json
-scan                      # full colour scan -> 1.tiff   (next run -> 2.tiff, ...)
+scan                      # full colour scan -> 1.tiff   (next run -> 2.tiff, ...), with auto-exposure
 scan --mono               # black & white negative, one pass (default red filter), about 2 minutes
 scan --preview            # quick 8-bit greyscale preview -> preview-1.tiff (no calibration needed)
 scan --positive           # 8-bit positive for looking at (negative inverted, auto levels)
+
+scan calibrate-sensor     # once per scanner, with the holder EMPTY (no film): measures the sensor's streak pattern
+scan calibrate-dark       # once per scanner, with the aperture covered (two layers of foil): measures the true black level
 ```
 
 **Calibration needs blank film in view**, either the clear gap between two frames or the leader (a band at least
@@ -49,7 +52,8 @@ scan --positive           # 8-bit positive for looking at (negative inverted, au
 refuses and saves the wide scan as `calibration-scan.png` instead of guessing. Details in
 [`docs/CALIBRATION.md`](docs/CALIBRATION.md).
 
-A colour scan takes 4 to 7 minutes. `scan --help` lists everything:
+A colour scan takes 6 to 8 minutes (about 1.5 minutes of that is the auto-exposure pre-scan; `--no-auto-exposure` skips it).
+`scan --help` lists everything:
 
 | Option | |
 |---|---|
@@ -58,9 +62,28 @@ A colour scan takes 4 to 7 minutes. `scan --help` lists everything:
 | `--mono [R\|G\|B]` | black & white: one filter only, default `R`; `--gray` writes a single-channel TIFF instead of 3 equal channels |
 | `--output display` | 8-bit gamma picture instead of the 16-bit linear file; `--invert`, `--auto-levels`, `--gamma G` apply to it; `--positive` is a shorthand |
 | `--no-flip`, `--flip-h`, `--rotate 90\|180\|270` | orientation (see below) |
+| `--sensor-profile FILE`, `--no-sensor-profile` | use another sensor pattern file, or skip that correction |
+| `--no-auto-exposure`, `--exposure STEPS` | skip the exposure pre-scan, or shift the exposure by STEPS (x1.26 each) relative to the calibrated one |
+| `--plain` | plain log lines instead of the live two-line display |
 | `--no-trim` | keep the film holder at the edges instead of trimming it |
 | `--keep-raw`, `--from-scan N.tiff.raw` | save the raw scanner bytes with the exact parameters used, and decode them again later |
 | `--device /dev/sgN` | skip auto-detection |
+
+### What you see while it runs
+
+In a terminal `scan` keeps two lines at the bottom: what is happening right now, and a progress bar.
+
+```
+⠧ Scanning: red pass 1/3 at DN03 — line 2400/4413                              34%  2:20  ~4:33 left
+█████████████████████████████████▏░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+```
+
+The top line shows the stage, the pass, the exposure and the line count (or, between passes, plain-language steps such as
+*autofocusing* or *moving the carriage*), then percent, elapsed time and an estimate of what is left. The bar is split into
+sections in proportion to their expected time, **coloured by what is being scanned**: red, green and blue for their
+passes (the small ones are the pre-scan), grey for start-up and processing. Bright means done, dim means to do. Notes such as
+the chosen exposure print above the display. When the output is not a terminal (a pipe, a log file) or with `--plain`, you
+get plain log lines instead; `NO_COLOR=1` removes the colours and marks the sections with `|`.
 
 ### Output
 
@@ -81,7 +104,7 @@ extensively with these files; file an issue with what you find.
 
 The scanner reports an **inverted** 8-bit signal (the film holder reads ~253, clearer film lower) and applies a
 256-entry table that you can write. `scan` writes a logarithmic table per channel (equal byte steps are equal
-density steps), uses a gain setting per channel chosen during calibration, and decodes the bytes to linear light in
+density steps), sets the exposure (`DN`) per channel, from calibration and a quick pre-scan of the frame, and decodes the bytes to linear light in
 software. Full explanation: [`docs/CALIBRATION.md`](docs/CALIBRATION.md) and [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 
 ## Safety
@@ -100,7 +123,9 @@ software. Full explanation: [`docs/CALIBRATION.md`](docs/CALIBRATION.md) and [`d
 - Only the scan windows seen in the original software are used (one resolution, 4413 x 2881 per frame). Other
   windows are blocked on purpose; the whitelist is in `scan.py` if you want to explore.
 - No infrared / dust channel, no dust removal, no multi-frame batch mode.
-- Very dense negatives lose their densest highlights (a hardware limit).
+- A single exposure cannot cover the whole range of a frame that has both very clear shadows and very dense
+  highlights (a sunlit B&W negative, for example): the densest areas sit at the floor. A higher exposure resolves them (to
+  density ~3.2 at DN10) but clips the clear areas; a merge of two exposures is not implemented yet.
 - One scanner, four film stocks tested. The `--mono` default (red) comes from one B&W frame.
 
 ## Development

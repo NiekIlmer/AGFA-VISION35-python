@@ -7,6 +7,7 @@ import os
 import random
 import struct
 import tempfile
+import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -258,14 +259,370 @@ class DecodeTests(unittest.TestCase):
         self.assertEqual(c.get("out_scale", scan.OUT_SCALE), 0.85)
 
 
+class ExposureTests(unittest.TestCase):
+    def test_dn_gain_law(self):
+        self.assertAlmostEqual(scan.dn_factor(1, 4), 2.0, delta=0.01)           # measured: DN04 = 2.0 x DN01
+        self.assertAlmostEqual(scan.dn_factor(1, 6), 10 ** 0.5, places=6)       # measured ~3.2
+        self.assertAlmostEqual(scan.dn_factor(6, 1) * scan.dn_factor(1, 6), 1.0)
+        self.assertAlmostEqual(scan.dn_factor(3, 4), 10 ** 0.1)
+        self.assertEqual(scan.dn_number("DN06"), 6)
+        self.assertEqual(scan.dn_name(6), "DN06")
+
+    def test_choose_exposure_limited_by_frame(self):
+        black = 253.0
+        # clearest area of the frame is only 0.25 x blank: plenty of room above the calibrated DN
+        n = scan.choose_exposure(3, 100.0, black, 25.0)
+        self.assertGreater(n, 3)
+        self.assertLessEqual(25.0 * scan.EXPOSURE_HEADROOM * scan.dn_factor(3, n), black - 4.0)
+        self.assertGreater(25.0 * scan.EXPOSURE_HEADROOM * scan.dn_factor(3, n + 1), black - 4.0) if n < scan.DN_MAX else None
+
+    def test_choose_exposure_never_above_dn_max_or_below_one(self):
+        self.assertEqual(scan.choose_exposure(3, 100.0, 253.0, 0.5), scan.DN_MAX)
+        self.assertEqual(scan.choose_exposure(1, 100.0, 253.0, 400.0), 1)       # saturated even at DN01
+        self.assertEqual(scan.choose_exposure(5, 100.0, 253.0, 400.0), 1)
+
+    def test_choose_exposure_keeps_calibrated_dn_when_frame_is_clear(self):
+        # a frame whose clearest area is as clear as the blank film (x1.3 headroom is already used up)
+        n = scan.choose_exposure(4, 190.0, 253.0, 190.0)       # calibration would stop at DN04 for 190 units of light
+        self.assertEqual(n, 4)
+
+    def test_virtual_blank_roundtrip(self):
+        """Scan at a DN different from the calibrated one: table and decode use the gain-scaled 'virtual' blank film."""
+        rnd = random.Random(11)
+        black, blank_cal, dn_cal = 253.0, 150.0, 2        # blank film light 103 at the calibrated DN02
+        for dn_scan in (1, 2, 5, 9):
+            L_virtual = (black - blank_cal) * scan.dn_factor(dn_cal, dn_scan)
+            blank_scan = black - L_virtual
+            t_hi = min(scan.T_HI_MAX, (black - 3.0) / L_virtual)
+            tbl = scan.build_table(black, blank_scan, t_hi)
+            dm = scan.decode_map(black, blank_scan, tbl, t_hi)
+            lo = scan.t_lo(black, blank_scan)
+            worst = 0.0
+            for _ in range(3000):
+                T = math.exp(rnd.uniform(math.log(lo * 4), math.log(t_hi * 0.95)))
+                s = black - T * L_virtual                 # what the scanner reports at this DN
+                i = int(s); f = s - i
+                y = int(round(tbl[i] + (tbl[min(i + 1, 255)] - tbl[i]) * f))
+                worst = max(worst, abs(math.log10(dm[y] / T)))
+            self.assertLess(worst, 0.025, (dn_scan, worst))
+
+    def test_higher_exposure_extends_the_dense_end(self):
+        black, blank_cal = 253.0, 150.0
+        lo_low = scan.t_lo(black, black - (black - blank_cal))
+        lo_high = scan.t_lo(black, black - (black - blank_cal) * scan.dn_factor(1, 7))
+        self.assertLess(lo_high, lo_low)                           # the floor of the encoded range gets denser
+
+    def test_cal_blank_default(self):
+        self.assertEqual(scan.cal_blank({"black": 253.0, "blank": 100.0}), 100.0)
+        self.assertEqual(scan.cal_blank({"black": 253.0, "blank": 100.0, "blank_scan": 40.0}), 40.0)
+
+    def test_frame_clear_levels_reads_only_the_scan_window(self):
+        # wide scan with a very clear stripe OUTSIDE the scan window (columns 5..15) and a dimmer picture inside
+        H = W = 385
+        S = [[[200 for _ in range(W)] for _ in range(H)]]
+        for y in range(H):
+            for x in range(5, 16):
+                S[0][y][x] = 30                               # blank leader outside the scan window
+        light = scan.frame_clear_levels(S, [253.0])[0]
+        self.assertAlmostEqual(light, 253.0 - 200, delta=1.0)  # not the stripe
+
+    def test_frame_clear_levels_excludes_blank_leader_inside_the_window(self):
+        # blank leader (very clear) at wide-scan columns 34..50, INSIDE the scan window; picture is dimmer
+        H = W = 385
+        S = [[[200 for _ in range(W)] for _ in range(H)]]
+        for y in range(H):
+            for x in range(34, 51):
+                S[0][y][x] = 30
+        with_leader = scan.frame_clear_levels(S, [253.0])[0]
+        without = scan.frame_clear_levels(S, [253.0], (34, 50))[0]
+        self.assertAlmostEqual(with_leader, 253.0 - 30, delta=1.0)    # fooled by the leader
+        self.assertAlmostEqual(without, 253.0 - 200, delta=1.0)       # picture only
+        # a fully blank frame: the 'blank area' covers most of the window, so nothing is excluded
+        S2 = [[[60 for _ in range(W)] for _ in range(H)]]
+        self.assertAlmostEqual(scan.frame_clear_levels(S2, [253.0], (30, 360))[0], 253.0 - 60, delta=1.0)
+
+
+class SensorPatternTests(unittest.TestCase):
+    def synthetic_lines(self, n=400, count=600, seed=3):
+        rnd = random.Random(seed)
+        true = [1.0 + 0.02 * math.sin(i * 0.9) + (0.03 if i == 150 else 0.0) for i in range(n)]
+        lines = []
+        for _ in range(count):
+            ln = bytearray()
+            for y in range(n):
+                light = 200.0 * true[y] * (1 + rnd.gauss(0, 0.003))
+                ln.append(max(0, min(255, int(round(253.1 - light)))))
+            ln.append(23)                                     # pad byte
+            lines.append(bytes(ln))
+        return true, lines
+
+    def test_pattern_recovers_multiplicative_response(self):
+        true, lines = self.synthetic_lines()
+        pat, sat = scan.sensor_pattern(lines)
+        self.assertEqual(len(pat), 400)
+        self.assertEqual(sat, 0.0)
+        k = 15
+        expect = []
+        for i in range(400):
+            half = min(k, i, 399 - i)
+            seg = true[i - half:i + half + 1]
+            expect.append(true[i] / (sum(seg) / len(seg)))
+        err = max(abs(a - b) for a, b in zip(pat, expect))
+        self.assertLess(err, 0.008)
+        self.assertGreater(pat[150], 1.02)                    # the single-sample spike is found
+
+    def test_saturated_scan_is_reported(self):
+        lines = [bytes([0] * 400 + [23]) for _ in range(600)]
+        pat, sat = scan.sensor_pattern(lines)
+        self.assertEqual(sat, 1.0)
+
+    def test_row_factor_applies_pattern(self):
+        pat = [1.0] * 100
+        pat[7] = 1.03
+        c = {"black": 253.0, "blank": 100.0, "pattern": pat}
+        self.assertAlmostEqual(scan.row_factor(c, 7), 1 / 1.03)
+        self.assertAlmostEqual(scan.row_factor(c, 8), 1.0)
+        self.assertAlmostEqual(scan.row_factor(c, 5000), 1.0)  # outside the pattern: no correction
+
+    def test_load_sensor_profile(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "sp.json")
+            self.assertEqual(scan.load_sensor_profile(path), ({}, None))
+            with open(path, "w") as fh:
+                fh.write('{"channels": {"G": {"pattern": [1.0, 1.01]}, "B": {"pattern": [0.99, 1.0]}, "R": {}}}')
+            prof, found = scan.load_sensor_profile(path)
+            self.assertEqual(found, path)
+            self.assertEqual(sorted(prof), ["B", "G"])             # red has no pattern
+            self.assertEqual(prof["G"], [1.0, 1.01])
+
+
+class DarkLevelTests(unittest.TestCase):
+    def test_dark_level_interpolates_and_clamps(self):
+        lv = {"DN00": 253.38, "DN04": 253.72, "DN08": 253.69, "DN12": 253.82}
+        self.assertAlmostEqual(scan.dark_level(lv, 0), 253.38)
+        self.assertAlmostEqual(scan.dark_level(lv, 2), (253.38 + 253.72) / 2)
+        self.assertAlmostEqual(scan.dark_level(lv, 12), 253.82)
+        self.assertAlmostEqual(scan.dark_level(lv, 20), 253.82)            # beyond the last measured step
+        self.assertAlmostEqual(scan.dark_level({"DN04": 253.5}, 1), 253.5)  # a single measurement
+
+    def test_cal_black_prefers_the_measured_dark_level(self):
+        self.assertEqual(scan.cal_black({"black": 253.2}), 253.2)
+        self.assertEqual(scan.cal_black({"black": 253.2, "black_scan": 253.74}), 253.74)
+
+    def test_dark_levels_from_wide(self):
+        S = [[[253 for _ in range(385)] for _ in range(385)] for _ in range(2)]
+        for y in range(385):
+            for x in range(385):
+                S[1][y][x] = 254
+        m = scan.dark_levels_from_wide(S)
+        self.assertAlmostEqual(m[0], 253.0)
+        self.assertAlmostEqual(m[1], 254.0)
+
+    def test_load_dark_levels(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "sp.json")
+            self.assertEqual(scan.load_dark_levels(path), ({}, None))
+            with open(path, "w") as fh:
+                fh.write('{"channels": {}, "dark": {"G": {"DN00": 253.4, "DN04": 253.7}}}')
+            dark, found = scan.load_dark_levels(path)
+            self.assertEqual(found, path)
+            self.assertEqual(dark["G"]["DN04"], 253.7)
+
+    def test_floor_goes_denser_with_exposure(self):
+        lo_dn1 = scan.t_lo(253.5, 253.5 - 220.0)                       # blank light 220 at DN01
+        lo_dn10 = scan.t_lo(253.5, 253.5 - 220.0 * scan.dn_factor(1, 10))
+        self.assertGreater(lo_dn1, lo_dn10)
+        self.assertLess(lo_dn10, 0.002)                                  # the old 0.002 cap no longer limits it
+
+
+ANSI = __import__("re").compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def strip_ansi(text):
+    return ANSI.sub("", text)
+
+
+class DisplayTests(unittest.TestCase):
+    def make(self, live=True, color=True, cols=80):
+        import io
+
+        class Out(io.StringIO):
+            encoding = "utf-8"                               # the display looks at the stream's encoding
+        out = Out()
+        d = scan.Display(out)
+        d.configure(live=live, color=color, cols=cols)
+        return d, out
+
+    def plan(self):
+        return [("prep", "grey", 10.0), ("R", "R", 30.0), ("G", "G", 30.0), ("B", "B", 30.0)]
+
+    def test_alloc_sums_and_keeps_every_section(self):
+        for weights in ([10, 30, 30, 30], [1, 1000, 1], [14.0, 75.0, 75.0, 75.0, 40.0], [5, 5]):
+            for total in (20, 79, 120):
+                cells = scan.Display.alloc(weights, total)
+                self.assertEqual(sum(cells), total, (weights, total))
+                self.assertTrue(all(c >= 1 for c in cells), (weights, total, cells))
+        cells = scan.Display.alloc([10, 30, 30, 30], 100)
+        self.assertEqual(cells, [10, 30, 30, 30])
+
+    def test_two_lines_of_the_right_width(self):
+        d, out = self.make(cols=80)
+        d.start(self.plan(), "Scanning")
+        d.next("prep")
+        d.next()
+        d.chan, d.ctx = "R", "red pass 1/3 at DN03"
+        d.lines(50, 100)
+        d._render()
+        last = out.getvalue().split("\x1b[2A")[-1]
+        rows = [strip_ansi(r) for r in last.replace("\r", "").split("\n") if strip_ansi(r) != ""]
+        self.assertEqual(len(rows), 2)
+        for r in rows:
+            self.assertLessEqual(len(r), 79)
+        self.assertIn("Scanning", rows[0])
+        self.assertIn("red pass 1/3 at DN03", rows[0])
+        self.assertIn("line 50/100", rows[0])
+        self.assertIn("%", rows[0])
+        self.assertEqual(len(rows[1]), 79)
+
+    def test_sections_are_coloured_by_channel(self):
+        d, out = self.make(cols=100)
+        d.start(self.plan(), "Scanning")
+        d.next("prep")
+        d.next()
+        d.progress(0.5)
+        d._render()
+        bar = out.getvalue().split("\n")[-2]
+        self.assertIn("\x1b[91m", bar)                         # red section (bright = filled)
+        self.assertIn("\x1b[31m", bar)                         # same hue, dim = not yet scanned
+        self.assertIn("\x1b[92m", bar)                         # green present (unfilled shows dim)
+        self.assertIn("\x1b[34m", bar)                         # blue, dim
+        plain = strip_ansi(bar).replace("\r", "")
+        # the red section is half full: grey prep is complete, G and B empty
+        self.assertEqual(plain.count("█"), 10 + 15)             # 10 prep cells + half of the 30 red cells at width 99?
+        d.finish("done")
+
+    def test_progress_bar_fraction_and_eta(self):
+        d, out = self.make()
+        d.start(self.plan(), "Scanning")
+        d.next("prep")
+        d.next()
+        d.progress(1.0)
+        self.assertAlmostEqual(d.overall(), (10 + 30) / 100.0)
+        d.next()
+        d.progress(0.5)
+        self.assertAlmostEqual(d.overall(), (10 + 30 + 15) / 100.0)
+        self.assertEqual(scan.Display.fmt(75), "1:15")
+        self.assertEqual(scan.Display.fmt(3725), "1:02:05")
+
+    def test_say_keeps_the_display_at_the_bottom(self):
+        d, out = self.make()
+        d.start(self.plan(), "Scanning")
+        d.say("a note")
+        text = out.getvalue()
+        i = text.index("a note")
+        self.assertIn("\x1b[2A\r\x1b[J", text[:i + 40])        # the old two lines were erased before the note
+        self.assertTrue(text[i:].count("\n") >= 3)              # note + a fresh two-line display after it
+
+    def test_finish_leaves_a_complete_display_and_normal_output_after(self):
+        d, out = self.make()
+        d.start(self.plan(), "Scanning")
+        d.finish("saved 1.tiff")
+        self.assertAlmostEqual(d.overall(), 1.0)
+        n_before = out.getvalue().count("\x1b[2A")
+        d.say("wrote 1.tiff")
+        self.assertEqual(out.getvalue().count("\x1b[2A"), n_before)     # no erasing after the end
+        self.assertTrue(out.getvalue().rstrip().endswith("wrote 1.tiff"))
+        self.assertIn("\x1b[?25h", out.getvalue())                       # cursor restored
+
+    def test_plain_mode_prints_only_log_lines(self):
+        d, out = self.make(live=False)
+        d.start(self.plan(), "Scanning")
+        d.next("prep")
+        d.next()
+        d.chan = "R"
+        for i in range(1, 401):
+            d.lines(i, 400)
+        d.say("done")
+        text = out.getvalue()
+        self.assertNotIn("\x1b", text)
+        self.assertIn("R line 200/400", text)
+        self.assertIn("R line 400/400", text)
+        self.assertTrue(text.rstrip().endswith("done"))
+
+    def test_no_color_mode(self):
+        d, out = self.make(color=False, cols=60)
+        d.start(self.plan(), "Scanning")
+        d.next("prep")
+        d.next()
+        d.progress(0.5)
+        d._render()
+        bar = out.getvalue().split("\n")[-2]
+        self.assertNotIn("\x1b[9", bar)                        # no colour codes in the bar
+        self.assertIn("|", bar)                                  # section boundaries are marked instead
+
+    def test_grey_sections_advance_with_time_until_reported(self):
+        d, out = self.make()
+        d.start([("prep", "grey", 20.0), ("R", "R", 60.0)], "Scanning")
+        d.next("prep")
+        seg = d.segs[0]
+        seg["t0"] = time.time() - 10.0                            # halfway through its expected 20 s
+        self.assertAlmostEqual(d._eff(seg), 0.5, delta=0.05)
+        seg["t0"] = time.time() - 500.0
+        self.assertEqual(d._eff(seg), 0.95)                       # never complete by itself
+        d.progress(0.25)                                          # an explicit report takes over
+        self.assertEqual(d._eff(seg), 0.25)
+        d.next()
+        self.assertEqual(d._eff(seg), 1.0)
+        self.assertEqual(d._eff({"p": 0.3, "kind": "R", "w": 5.0, "t0": time.time() - 100}), 0.3)   # coloured: explicit only
+
+    def test_finish_says_done(self):
+        d, out = self.make()
+        d.start(self.plan(), "Processing")
+        d.finish("saved 3.tiff")
+        self.assertIn("Done — saved 3.tiff", strip_ansi(out.getvalue()))
+
+    def test_extend_and_reweight(self):
+        d, out = self.make()
+        d.start(self.plan(), "Scanning")
+        d.extend([("analysing", "grey", 10.0)])
+        self.assertEqual(len(d.segs), 5)
+        d.reweight(1, [60.0, 60.0])
+        self.assertEqual(d.segs[1]["w"], 60.0)
+        self.assertEqual(d.segs[3]["w"], 30.0)                   # untouched
+
+    def test_extra_next_calls_are_harmless(self):
+        d, out = self.make()
+        d.start([("prep", "grey", 5.0)], "x")
+        for _ in range(4):
+            d.next()
+        d.progress(0.5)
+        d.lines(1, 2)
+
+    def test_friendly_status_text(self):
+        self.assertEqual(scan.friendly("AF,R"), "autofocusing")
+        self.assertEqual(scan.friendly("MV345,R"), "moving the carriage")
+        self.assertEqual(scan.friendly("FG,R"), "selecting the green filter")
+        self.assertIn("DN04", scan.friendly("DN04"))
+        self.assertEqual(scan.friendly("BXZ 0,0,4999,4999,13,13,V"), "starting the scan")
+        for cmd in ("APIN", "MP", "IF15", "SPUP", "PSOF"):
+            self.assertTrue(scan.friendly(cmd))
+
+    def test_plans_have_the_expected_sections(self):
+        self.assertEqual([k for _, k, _ in scan.plan_wide((0, 1, 2))], ["grey", "R", "G", "B"])
+        plan = scan.plan_scan((1,), [5])
+        self.assertEqual([k for _, k, _ in plan], ["grey", "G"])
+        self.assertGreater(scan.est_pass_seconds(0, 4), scan.est_pass_seconds(0, 1))    # red slows down with exposure
+        self.assertAlmostEqual(scan.est_pass_seconds(1, 1), scan.SCAN_LINES * 0.017)    # green stays at the line-time floor
+
+
 class SafetyTests(unittest.TestCase):
     def test_text_whitelist(self):
         ok = ["APIN", "OUT8", "AF,R", "MP", "CP", "GML8", "IF15", "INM", "SPUP", "NHD", "AP50", "AVOF", "SDON",
-              "DN01", "DN04", "BRT0", "CNT0", "SFT0", "PSOF", "PVOF", "FR,R", "FG,R", "FB,R", "GM1T8", "GM2T8",
+              "DN00", "DN01", "DN04", "DN02", "DN06", "DN09", "DN12", "BRT0", "CNT0", "SFT0", "PSOF", "PVOF", "FR,R", "FG,R", "FB,R", "GM1T8", "GM2T8",
               "GM3T8", "MV0,R", "MV345,R", scan.PREVIEW_BXZ, scan.SCAN_BXZ]
         for t in ok:
             self.assertTrue(scan.ALLOWED_TEXT.match(t), t)
-        for t in ["DN02", "MV100,R", "BXZ 0,0,100,100,1,1,V", "FORMAT", "FW", "WGM1T,1,2,3", "APIN;PSOF", "apin"]:
+        for t in ["DN13", "DN99", "DN1", "DN001", "MV100,R", "BXZ 0,0,100,100,1,1,V", "FORMAT", "FW", "WGM1T,1,2,3", "APIN;PSOF", "apin"]:
             self.assertFalse(scan.ALLOWED_TEXT.match(t), t)
 
     def test_only_safe_scsi_opcodes(self):

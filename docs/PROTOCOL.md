@@ -92,31 +92,62 @@ end:     header 02 00 01 C0 (or C2), then a 1-byte payload 03
 | `AF,R` | autofocus, takes about 10 s (status `06`) |
 | `MV0,R` `MV345,R` | move the carriage to a start position (status `06`) |
 | `BXZ x0,y0,x1,y1,sx,sy,V` | scan window, see above |
-| `DN01` `DN04` | analogue gain setting, see below |
+| `DNnn` | exposure / minimum-density setting, see below |
 | `GM1T8` `GM2T8` `GM3T8` | select table 1, 2 or 3 for the next pass |
 | `WGMnT,v0,v1,...,v255` | write table *n* (1 to 3), see below |
 | `APIN` `OUT8` `MP` `CP` `GML8` `IF15` `INM` `SPUP` `NHD` `AP50` `AVOF` `SDON` `BRT0` `CNT0` `SFT0` `PSOF` `PVOF` | sent verbatim in the order the original software uses; meaning unknown. `PSOF`/`PVOF` are sent after a scan, `APIN`/`OUT8` start the init sequence. |
 
 Strings `DZ%d`, `BXD`, `INT`, `SFC%ld` also appear in the original program but were not seen on the wire.
 
-### DN (gain)
+### DN (exposure)
 
-`DN01` and `DN04` are the two values seen in the capture. Measured on three channels of the same film:
+`DNnn` is a **minimum-density setting of nn/10**: the scanner lengthens its exposure per line by 10^(nn/10), so
+one step is x1.26 and the light scales as `10^((n-m)/10)` between DN m and DN n. Evidence:
 
-```
-signal(DN01) = 255 - (255 - signal(DN04)) / 2.04
-```
+- The original's readme says a scan can become extremely slow when "Dmin" is set too high, because the scanner
+  raises the *exposure time per scan line*, up to a second per line.
+- Disassembly of `FOTOLOOK.EX` shows the command being built as `DN%02d` of `(Dmin_in_thousandths + 50) / 100`,
+  i.e. Dmin rounded to 0.1 density.
+- Measured on blank film, every step from DN01 to DN07 raised the light by about 1.26x (DN04/DN01 = 2.0,
+  DN06/DN01 = 3.2), per channel, linearly and anchored at the holder level. Across several steps the measured gain
+  ran a few percent above the nominal law.
 
-so **DN04 is the same signal with 2.04x the gain**, anchored at the holder level. DN04 gives more precision but
-clips bright areas earlier. `DN` is only **latched by the next filter command** (`FR,R`/`FG,R`/`FB,R`). Sending it
-after the filter command has no effect on that pass. The original software never changes it between passes, so
-this never showed up in the capture.
+Values `DN00` to `DN16` were accepted (`scan` uses `DN01` to `DN12`, and `DN00` only for the empty-holder sensor calibration). `DN` is only **latched by the next filter command**
+(`FR,R`/`FG,R`/`FB,R`): sending it after the filter command has no effect on that pass. The capture never shows
+this because it never changes DN between passes after the filter command. It does use different values:
+DN01 for red and green and **DN06 for blue** in the pre-scans, DN04 for all three in the final scan.
+
+The steps are not exactly uniform (probably quantized exposure times). Measured between scans of the same frame
+(green): 1.280 per step from DN01 to DN06, 1.262 from DN06 to DN08, 1.281 from DN08 to DN10, against the nominal 1.259, so
+the real exposure at DN10 was about 14 % above the 10^(n/10) law. That does not matter for a single scan (a converter
+normalises to the film base), but anything combining exposures has to measure the ratio from the overlap.
+
+How DN affects things:
+
+- **Saturation**: more exposure means more light, so clear film saturates (reads 0) sooner. A channel can use
+  the highest DN at which the clearest area it has to record stays below saturation.
+- **Time**: the time per line is flat while the exposure fits in the line period, then grows. Per-line time in
+  wide scans was 40 to 60 ms up to DN12, 78 ms at DN14 and 123 ms at DN16 (green). Red needs a longer exposure
+  than green and blue at the same DN: in full scans red took about 27 ms per line at DN03 and 33 ms at DN04,
+  against 17 ms at DN01 or for green at DN04. `scan` stays at DN12 or below.
+- **Noise**: a blank-film pixel shows 5 to 10 % variation relative to its signal at every DN (green: 9.3 % at DN01,
+  7.5 %, 10.3 %, 10.0 %, 6.4 %, 8.2 % at DN06), so more exposure does not reduce *that*. That variation is the film's own
+  texture: it is 98.7 to 99.7 % identical between repeat scans (correlation 0.987 to 0.997), so the random part
+  of the scanner's noise is only about 1 to 2 %.
+- **Measurement error**: with the film texture cancelled (same frame at two exposures), the scan-to-scan difference
+  was 2.6 % of the signal at DN01 against DN05 and 1.2 % at DN03 against DN05, falling roughly with 1/exposure. It is mostly
+  quantization of the raw signal, so more exposure helps most in the dense end of a negative.
+
+Open light (no film in the holder): at DN01 the whole aperture saturates in all three channels. At `DN00`,
+the lowest setting, green reads 237 and blue 219 of 253 (usable), red still saturates over about half the aperture.
+Together with blank-film readings this gives the base transmittance of the blank Phoenix 200 frame as about 21 % (green) and
+29 % (blue), i.e. density about 0.67 and 0.53.
 
 ### Signal polarity
 
 The 8-bit value `s` is **inverted**: a completely dark area (the film holder) reads about **253**, and clearer
-film reads lower. Light is linear in `(s_black - s)`; the holder level is the same in every channel and at both DN
-values (253.0 to 253.7), which is how the true black is measured.
+film reads lower. Light is linear in `(s_black - s)`; the holder level is the same in every channel and at every DN
+value (253.0 to 253.7), which is how the true black is measured.
 
 ### Tables (`WGMnT`)
 
@@ -135,13 +166,15 @@ The scanner applies a 256-entry table to its signal before sending bytes: the ta
 
 ## Timing
 
-Preview about 25 s. A wide scan of all three channels takes about a minute. A full colour scan takes 4 to 7
-minutes (70 to 140 s per channel depending on DN, plus a ~10 s autofocus at the start). A mono scan takes about
-2 minutes.
+Preview about 25 s. A wide scan of all three channels takes about a minute. A full colour scan takes 4 to 8
+minutes (75 to 145 s per channel depending on channel and DN, plus a ~10 s autofocus at the start), and the
+auto-exposure pre-scan adds about a minute and a half. A mono scan takes about 2 to 3 minutes.
 
 ## Not known / worth exploring
 
 - The meaning of most init commands and the 4th header byte.
 - Other scan windows or resolutions (the code only uses windows seen in the capture).
 - The infrared channel, if any, and dust handling.
-- Whether other DN values exist.
+- DN values above 16, and what happens to the line time there (it grows from about DN14).
+- Scan windows and carriage positions other than the ones in the capture (untested; see the safety notes).
+- Edge sharpness (resolution) per channel and per exposure, and whether the per-line exposure adds motion blur.
